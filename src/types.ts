@@ -6,6 +6,7 @@ export interface ConversationSession {
   isActive: boolean;
   lastActivity: Date;
   workingDirectory?: string;
+  turns: number;
 }
 
 export interface WorkingDirectoryConfig {

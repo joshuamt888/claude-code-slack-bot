@@ -1,6 +1,6 @@
 import { App } from '@slack/bolt';
 import { ClaudeHandler } from './claude-handler';
-import { SDKMessage } from '@anthropic-ai/claude-code';
+import { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { Logger } from './logger';
 import { WorkingDirectoryManager } from './working-directory-manager';
 import { FileHandler, ProcessedFile } from './file-handler';
@@ -8,6 +8,8 @@ import { TodoManager, Todo } from './todo-manager';
 import { McpManager } from './mcp-manager';
 import { permissionServer } from './permission-mcp-server';
 import { config } from './config';
+import * as fs from 'fs';
+import * as path from 'path';
 
 interface MessageEvent {
   user: string;
@@ -15,6 +17,7 @@ interface MessageEvent {
   thread_ts?: string;
   ts: string;
   text?: string;
+  channelContext?: string;
   files?: Array<{
     id: string;
     name: string;
@@ -147,47 +150,17 @@ export class SlackHandler {
       return;
     }
 
-    // Check if we have a working directory set
+    // Use agent directory as working directory, with optional override
     const isDM = channel.startsWith('D');
     const workingDirectory = this.workingDirManager.getWorkingDirectory(
       channel,
       thread_ts,
       isDM ? user : undefined
-    );
+    ) || config.agent.dir;
 
-    // Working directory is always required
-    if (!workingDirectory) {
-      let errorMessage = `⚠️ No working directory set. `;
-      
-      if (!isDM && !this.workingDirManager.hasChannelWorkingDirectory(channel)) {
-        // No channel default set
-        errorMessage += `Please set a default working directory for this channel first using:\n`;
-        if (config.baseDirectory) {
-          errorMessage += `\`cwd project-name\` or \`cwd /absolute/path\`\n\n`;
-          errorMessage += `Base directory: \`${config.baseDirectory}\``;
-        } else {
-          errorMessage += `\`cwd /path/to/directory\``;
-        }
-      } else if (thread_ts) {
-        // In thread but no thread-specific directory
-        errorMessage += `You can set a thread-specific working directory using:\n`;
-        if (config.baseDirectory) {
-          errorMessage += `\`@claudebot cwd project-name\` or \`@claudebot cwd /absolute/path\``;
-        } else {
-          errorMessage += `\`@claudebot cwd /path/to/directory\``;
-        }
-      } else {
-        errorMessage += `Please set one first using:\n\`cwd /path/to/directory\``;
-      }
-      
-      await say({
-        text: errorMessage,
-        thread_ts: thread_ts || ts,
-      });
-      return;
-    }
-
-    const sessionKey = this.claudeHandler.getSessionKey(user, channel, thread_ts || ts);
+    // DMs without threads use one continuous session; channels use thread-based sessions
+    const sessionThreadTs = isDM ? (thread_ts || undefined) : (thread_ts || ts);
+    const sessionKey = this.claudeHandler.getSessionKey(user, channel, sessionThreadTs);
     
     // Store the original message info for status reactions
     const originalMessageTs = thread_ts || ts;
@@ -203,22 +176,64 @@ export class SlackHandler {
     const abortController = new AbortController();
     this.activeControllers.set(sessionKey, abortController);
 
-    let session = this.claudeHandler.getSession(user, channel, thread_ts || ts);
+    let session = this.claudeHandler.checkAndResetSession(user, channel, thread_ts || ts);
     if (!session) {
       this.logger.debug('Creating new session', { sessionKey });
       session = this.claudeHandler.createSession(user, channel, thread_ts || ts);
     } else {
-      this.logger.debug('Using existing session', { sessionKey, sessionId: session.sessionId });
+      this.logger.debug('Using existing session', { sessionKey, sessionId: session.sessionId, turns: session.turns });
     }
+    session.turns++;
+    session.lastActivity = new Date();
 
     let currentMessages: string[] = [];
     let statusMessageTs: string | undefined;
 
     try {
-      // Prepare the prompt with file attachments
-      const finalPrompt = processedFiles.length > 0 
-        ? await this.fileHandler.formatFilePrompt(processedFiles, text || '')
-        : text || '';
+      // Prepare the prompt with channel context and user profile
+      let basePrompt = text || '';
+
+      // Load user profile if it exists
+      const userName = await this.resolveUserName(user);
+      const userSlug = userName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+      const userProfilePath = path.join(config.agent.dir, 'users', `${userSlug}.md`);
+      let userContext = '';
+      if (fs.existsSync(userProfilePath)) {
+        const profile = fs.readFileSync(userProfilePath, 'utf-8').trim();
+        userContext = `\n[User profile for ${userName}:\n${profile}\n]`;
+      }
+
+      // If this message arrived inside a Slack thread, pull the full thread
+      // history and inject it into the prompt. This makes agents thread-aware:
+      // any agent @mentioned in a thread sees what everyone else said above,
+      // regardless of which bot's session was previously active. Stateless and
+      // resilient — no cross-agent session sharing required.
+      let threadHistoryBlock = '';
+      if (thread_ts) {
+        threadHistoryBlock = await this.fetchThreadHistory(channel, thread_ts, ts);
+        if (threadHistoryBlock) {
+          this.logger.debug('Injected thread history', {
+            chars: threadHistoryBlock.length,
+            threadTs: thread_ts,
+          });
+        }
+      }
+
+      // Include the current thread_ts in the channel context header so agents
+      // know which thread they're in — and can pass it to post-as.sh --thread
+      // for threaded handoffs.
+      let channelContextStr = event.channelContext || '';
+      if (thread_ts && channelContextStr) {
+        // Insert "| Thread: <ts>" just before the closing bracket of the header
+        channelContextStr = channelContextStr.replace(/\]\s*$/, ` | Thread: ${thread_ts}]`);
+      }
+
+      if (channelContextStr || userContext || threadHistoryBlock) {
+        basePrompt = `${channelContextStr}${userContext}\n${threadHistoryBlock}${basePrompt}`;
+      }
+      const finalPrompt = processedFiles.length > 0
+        ? await this.fileHandler.formatFilePrompt(processedFiles, basePrompt)
+        : basePrompt;
 
       this.logger.info('Sending query to Claude Code SDK', { 
         prompt: finalPrompt.substring(0, 200) + (finalPrompt.length > 200 ? '...' : ''), 
@@ -302,13 +317,33 @@ export class SlackHandler {
             }
           }
         } else if (message.type === 'result') {
-          this.logger.info('Received result from Claude SDK', {
+          const cost = (message as any).total_cost_usd;
+          const duration = (message as any).duration_ms;
+          const inputTokens = (message as any).usage?.input_tokens;
+          const outputTokens = (message as any).usage?.output_tokens;
+
+          this.logger.info('Result', {
             subtype: message.subtype,
-            hasResult: message.subtype === 'success' && !!(message as any).result,
-            totalCost: (message as any).total_cost_usd,
-            duration: (message as any).duration_ms,
+            cost,
+            duration,
+            inputTokens,
+            outputTokens,
           });
-          
+
+          // Log usage to file for monitoring
+          this.logUsage({
+            agent: config.agent.name,
+            user,
+            channel,
+            threadTs: thread_ts || ts,
+            cost,
+            durationMs: duration,
+            inputTokens,
+            outputTokens,
+            turns: session?.turns,
+            timestamp: new Date().toISOString(),
+          });
+
           if (message.subtype === 'success' && (message as any).result) {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
@@ -651,6 +686,95 @@ export class SlackHandler {
     return /^(mcp|servers?)\s+(reload|refresh)$/i.test(text.trim());
   }
 
+  private userNameCache: Map<string, string> = new Map();
+
+  private async resolveUserName(userId: string): Promise<string> {
+    if (this.userNameCache.has(userId)) return this.userNameCache.get(userId)!;
+    try {
+      const result = await this.app.client.users.info({ user: userId });
+      const name = (result.user as any)?.real_name || (result.user as any)?.name || userId;
+      this.userNameCache.set(userId, name);
+      return name;
+    } catch {
+      return userId;
+    }
+  }
+
+  /**
+   * Fetch the full thread history up to (but not including) the current message
+   * and format it as a [Thread history: ...] block that can be prepended to the
+   * agent's prompt. This makes every agent thread-aware and stateless: any agent
+   * @mentioned in a thread sees exactly what everyone else said, regardless of
+   * whose bot previously held the session.
+   *
+   * Hard cap: 50 messages / 8000 chars to keep token cost reasonable.
+   * If a thread somehow runs longer, we keep the most recent messages and
+   * indicate truncation at the top.
+   */
+  private async fetchThreadHistory(
+    channel: string,
+    threadTs: string,
+    currentMessageTs: string,
+  ): Promise<string> {
+    try {
+      const result = await this.app.client.conversations.replies({
+        channel,
+        ts: threadTs,
+        limit: 60,
+      });
+      const messages = (result.messages || []) as any[];
+      if (messages.length <= 1) return ''; // only the current message — nothing to show
+
+      // Drop the current message (and anything newer) — we only want prior context.
+      const prior = messages.filter(m => m.ts && m.ts < currentMessageTs);
+      if (prior.length === 0) return '';
+
+      // Resolve display names for every unique speaker in the thread.
+      const formatted: string[] = [];
+      for (const m of prior) {
+        let speaker = 'Unknown';
+        if (m.bot_profile?.name) {
+          speaker = m.bot_profile.name;
+        } else if (m.username) {
+          speaker = m.username;
+        } else if (m.user) {
+          speaker = await this.resolveUserName(m.user);
+        }
+        // Strip Slack user-mention tokens like <@U0ARU06HVEV> down to readable names
+        // so the agent doesn't have to parse Slack ID syntax.
+        const rawText = (m.text || '').replace(/<@([UW][A-Z0-9]+)>/g, (_: string, uid: string) => {
+          const cached = this.userNameCache.get(uid);
+          return cached ? `@${cached}` : `@${uid}`;
+        });
+        if (rawText.trim()) {
+          formatted.push(`${speaker}: ${rawText.trim()}`);
+        }
+      }
+
+      if (formatted.length === 0) return '';
+
+      // Truncate from the oldest end if the block grows too large.
+      const MAX_CHARS = 8000;
+      const MAX_LINES = 50;
+      let truncated = false;
+      while (
+        formatted.length > MAX_LINES ||
+        formatted.join('\n').length > MAX_CHARS
+      ) {
+        formatted.shift();
+        truncated = true;
+      }
+
+      const header = truncated
+        ? '[Thread history (older messages truncated — showing most recent):'
+        : '[Thread history:';
+      return `${header}\n${formatted.join('\n')}\n]\n`;
+    } catch (err) {
+      this.logger.error('Failed to fetch thread history', err);
+      return '';
+    }
+  }
+
   private async getBotUserId(): Promise<string> {
     if (!this.botUserId) {
       try {
@@ -664,38 +788,85 @@ export class SlackHandler {
     return this.botUserId;
   }
 
-  private async handleChannelJoin(channelId: string, say: any): Promise<void> {
-    try {
-      // Get channel info
-      const channelInfo = await this.app.client.conversations.info({
-        channel: channelId,
-      });
+  private getStatusReport(userId: string): string {
+    const agentName = config.agent.name.charAt(0).toUpperCase() + config.agent.name.slice(1);
+    const agentDir = config.agent.dir;
+    const lines: string[] = [];
 
-      const channelName = (channelInfo.channel as any)?.name || 'this channel';
-      
-      let welcomeMessage = `👋 Hi! I'm Claude Code, your AI coding assistant.\n\n`;
-      welcomeMessage += `To get started, I need to know the default working directory for #${channelName}.\n\n`;
-      
-      if (config.baseDirectory) {
-        welcomeMessage += `You can use:\n`;
-        welcomeMessage += `• \`cwd project-name\` (relative to base directory: \`${config.baseDirectory}\`)\n`;
-        welcomeMessage += `• \`cwd /absolute/path/to/project\` (absolute path)\n\n`;
-      } else {
-        welcomeMessage += `Please set it using:\n`;
-        welcomeMessage += `• \`cwd /path/to/project\` or \`set directory /path/to/project\`\n\n`;
+    lines.push(`*${agentName} — Status*\n`);
+
+    // CLAUDE.md size
+    const claudeMdPath = path.join(agentDir, 'CLAUDE.md');
+    if (fs.existsSync(claudeMdPath)) {
+      const content = fs.readFileSync(claudeMdPath, 'utf-8');
+      const lineCount = content.split('\n').length;
+      lines.push(`📄 *CLAUDE.md:* ${lineCount} lines`);
+    }
+
+    // Task files
+    const tasksDir = path.join(agentDir, 'tasks');
+    if (fs.existsSync(tasksDir)) {
+      const taskFiles = fs.readdirSync(tasksDir).filter(f => f.endsWith('.md'));
+      lines.push(`📋 *Task files:* ${taskFiles.length} (${taskFiles.join(', ') || 'none'})`);
+    }
+
+    // User profiles
+    const usersDir = path.join(agentDir, 'users');
+    if (fs.existsSync(usersDir)) {
+      const userFiles = fs.readdirSync(usersDir).filter(f => f.endsWith('.md'));
+      lines.push(`👥 *User profiles:* ${userFiles.length} (${userFiles.map(f => f.replace('.md', '')).join(', ') || 'none'})`);
+    }
+
+    // Current session
+    const session = this.claudeHandler.getSession(userId, config.agent.channelId || '');
+    if (session?.sessionId) {
+      const age = Math.round((Date.now() - new Date(session.lastActivity).getTime()) / 60000);
+      lines.push(`💬 *Session:* ${session.turns} turns, last active ${age}m ago`);
+    } else {
+      lines.push(`💬 *Session:* none active`);
+    }
+
+    // Today's usage from log
+    const logFile = path.join(__dirname, '..', 'logs', 'usage.jsonl');
+    if (fs.existsSync(logFile)) {
+      const today = new Date().toISOString().split('T')[0];
+      const logLines = fs.readFileSync(logFile, 'utf-8').trim().split('\n');
+      let todayCost = 0;
+      let todayRequests = 0;
+      for (const line of logLines) {
+        try {
+          const entry = JSON.parse(line);
+          if (entry.agent === config.agent.name && entry.timestamp?.startsWith(today)) {
+            todayCost += entry.cost || 0;
+            todayRequests++;
+          }
+        } catch {}
       }
-      
-      welcomeMessage += `This will be the default working directory for this channel. `;
-      welcomeMessage += `You can always override it for specific threads by mentioning me with a different \`cwd\` command.\n\n`;
-      welcomeMessage += `Once set, you can ask me to help with code reviews, file analysis, debugging, and more!`;
+      lines.push(`📊 *Today:* ${todayRequests} requests, $${todayCost.toFixed(4)} cost`);
+    }
 
-      await say({
-        text: welcomeMessage,
-      });
+    // MCP servers
+    const mcpServers = this.mcpManager.getServerConfiguration();
+    if (mcpServers && Object.keys(mcpServers).length > 0) {
+      lines.push(`🔌 *MCP servers:* ${Object.keys(mcpServers).join(', ')}`);
+    } else {
+      lines.push(`🔌 *MCP servers:* none`);
+    }
 
-      this.logger.info('Sent welcome message to channel', { channelId, channelName });
-    } catch (error) {
-      this.logger.error('Failed to handle channel join', error);
+    // Working directory
+    lines.push(`📁 *Directory:* \`${agentDir}\``);
+
+    return lines.join('\n');
+  }
+
+  private logUsage(entry: Record<string, any>): void {
+    try {
+      const logDir = path.join(__dirname, '..', 'logs');
+      if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+      const logFile = path.join(logDir, 'usage.jsonl');
+      fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
+    } catch (err) {
+      this.logger.error('Failed to log usage', err);
     }
   }
 
@@ -713,40 +884,46 @@ export class SlackHandler {
   }
 
   setupEventHandlers() {
-    // Handle direct messages
+    // Agent's own channel: respond to everything without @mention
     this.app.message(async ({ message, say }) => {
-      if (message.subtype === undefined && 'user' in message) {
-        this.logger.info('Handling direct message event');
-        await this.handleMessage(message as MessageEvent, say);
-      }
+      if (message.subtype !== undefined && message.subtype !== 'file_share') return;
+      if (!('user' in message)) return;
+
+      const event = message as MessageEvent;
+      const botUserId = await this.getBotUserId();
+
+      if (event.user === botUserId) return;
+      if ((message as any).bot_id) return;
+
+      const isAgentChannel = config.agent.channelId && event.channel === config.agent.channelId;
+
+      // Only respond in agent's own channel (without @mention)
+      if (!isAgentChannel) return;
+
+      const text = event.text?.replace(/<@[^>]+>/g, '').trim() || '';
+
+      this.logger.info('Handling agent channel message', { channel: event.channel });
+      const userName = await this.resolveUserName(event.user);
+      await this.handleMessage({ ...event, text, channelContext: `[Channel: your private channel | User: ${userName}]` } as MessageEvent, say);
     });
 
-    // Handle app mentions
+    // Handle @mentions in agent-hub only
     this.app.event('app_mention', async ({ event, say }) => {
-      this.logger.info('Handling app mention event');
+      const isHub = config.agent.hubChannelId && event.channel === config.agent.hubChannelId;
+      const isAgentChannel = config.agent.channelId && event.channel === config.agent.channelId;
+
+      // Only respond to @mentions in agent-hub (agent channel handled above)
+      if (!isHub && !isAgentChannel) return;
+
+      this.logger.info('Handling @mention', { channel: event.channel });
       const text = event.text.replace(/<@[^>]+>/g, '').trim();
+
+      const hubUserName = await this.resolveUserName(event.user);
       await this.handleMessage({
         ...event,
         text,
+        channelContext: `[Channel: #agent-hub (shared team channel — other agents and people are here) | User: ${hubUserName}]`,
       } as MessageEvent, say);
-    });
-
-    // Handle file uploads in threads
-    this.app.event('message', async ({ event, say }) => {
-      // Only handle file uploads that are not from bots and have files
-      if (event.subtype === 'file_share' && 'user' in event && event.files) {
-        this.logger.info('Handling file upload event');
-        await this.handleMessage(event as MessageEvent, say);
-      }
-    });
-
-    // Handle bot being added to channels
-    this.app.event('member_joined_channel', async ({ event, say }) => {
-      // Check if the bot was added to the channel
-      if (event.user === await this.getBotUserId()) {
-        this.logger.info('Bot added to channel', { channel: event.channel });
-        await this.handleChannelJoin(event.channel, say);
-      }
     });
 
     // Handle permission approval button clicks

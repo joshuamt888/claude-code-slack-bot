@@ -1,7 +1,12 @@
-import { query, type SDKMessage } from '@anthropic-ai/claude-code';
+import { query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { ConversationSession } from './types';
 import { Logger } from './logger';
 import { McpManager, McpServerConfig } from './mcp-manager';
+import { config } from './config';
+import * as path from 'path';
+import * as fs from 'fs';
+
+const SESSIONS_FILE = path.join(__dirname, '..', `sessions-${config.agent.name}.json`);
 
 export class ClaudeHandler {
   private sessions: Map<string, ConversationSession> = new Map();
@@ -10,6 +15,35 @@ export class ClaudeHandler {
 
   constructor(mcpManager: McpManager) {
     this.mcpManager = mcpManager;
+    this.loadSessions();
+  }
+
+  private loadSessions(): void {
+    try {
+      if (fs.existsSync(SESSIONS_FILE)) {
+        const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf-8'));
+        for (const [key, session] of Object.entries(data)) {
+          const s = session as any;
+          s.lastActivity = new Date(s.lastActivity);
+          this.sessions.set(key, s as ConversationSession);
+        }
+        this.logger.info(`Loaded ${this.sessions.size} sessions from disk`);
+      }
+    } catch (err) {
+      this.logger.error('Failed to load sessions from disk', err);
+    }
+  }
+
+  private saveSessions(): void {
+    try {
+      const data: Record<string, any> = {};
+      for (const [key, session] of this.sessions.entries()) {
+        data[key] = session;
+      }
+      fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    } catch (err) {
+      this.logger.error('Failed to save sessions to disk', err);
+    }
   }
 
   getSessionKey(userId: string, channelId: string, threadTs?: string): string {
@@ -27,9 +61,15 @@ export class ClaudeHandler {
       threadTs,
       isActive: true,
       lastActivity: new Date(),
+      turns: 0,
     };
     this.sessions.set(this.getSessionKey(userId, channelId, threadTs), session);
+    this.saveSessions();
     return session;
+  }
+
+  checkAndResetSession(userId: string, channelId: string, threadTs?: string): ConversationSession | undefined {
+    return this.sessions.get(this.getSessionKey(userId, channelId, threadTs));
   }
 
   async *streamQuery(
@@ -41,13 +81,12 @@ export class ClaudeHandler {
   ): AsyncGenerator<SDKMessage, void, unknown> {
     const options: any = {
       outputFormat: 'stream-json',
-      permissionMode: slackContext ? 'default' : 'bypassPermissions',
+      permissionMode: 'bypassPermissions',
     };
 
-    // Add permission prompt tool if we have Slack context
-    if (slackContext) {
-      options.permissionPromptToolName = 'mcp__permission-prompt__permission_prompt';
-      this.logger.debug('Added permission prompt tool for Slack integration', slackContext);
+    // Per-agent model override (set via CLAUDE_MODEL in the agent's .env.slack)
+    if (config.claude.model) {
+      options.model = config.claude.model;
     }
 
     if (workingDirectory) {
@@ -57,34 +96,12 @@ export class ClaudeHandler {
     // Add MCP server configuration if available
     const mcpServers = this.mcpManager.getServerConfiguration();
     
-    // Add permission prompt server if we have Slack context
-    if (slackContext) {
-      const permissionServer = {
-        'permission-prompt': {
-          command: 'npx',
-          args: ['tsx', '/Users/marcelpociot/Experiments/claude-code-slack/src/permission-mcp-server.ts'],
-          env: {
-            SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
-            SLACK_CONTEXT: JSON.stringify(slackContext)
-          }
-        }
-      };
-      
-      if (mcpServers) {
-        options.mcpServers = { ...mcpServers, ...permissionServer };
-      } else {
-        options.mcpServers = permissionServer;
-      }
-    } else if (mcpServers && Object.keys(mcpServers).length > 0) {
+    if (mcpServers && Object.keys(mcpServers).length > 0) {
       options.mcpServers = mcpServers;
     }
     
     if (options.mcpServers && Object.keys(options.mcpServers).length > 0) {
-      // Allow all MCP tools by default, plus permission prompt tool
       const defaultMcpTools = this.mcpManager.getDefaultAllowedTools();
-      if (slackContext) {
-        defaultMcpTools.push('mcp__permission-prompt');
-      }
       if (defaultMcpTools.length > 0) {
         options.allowedTools = defaultMcpTools;
       }
@@ -106,6 +123,17 @@ export class ClaudeHandler {
 
     this.logger.debug('Claude query options', options);
 
+    // Use the LOCAL bundled Claude CLI from node_modules (isolates the bot from
+    // whatever version is globally installed — global upgrades won't affect us).
+    options.pathToClaudeCodeExecutable = path.join(
+      __dirname,
+      '..',
+      'node_modules',
+      '@anthropic-ai',
+      'claude-code',
+      'cli.js',
+    );
+
     try {
       for await (const message of query({
         prompt,
@@ -115,7 +143,8 @@ export class ClaudeHandler {
         if (message.type === 'system' && message.subtype === 'init') {
           if (session) {
             session.sessionId = message.session_id;
-            this.logger.info('Session initialized', { 
+            this.saveSessions();
+            this.logger.info('Session initialized', {
               sessionId: message.session_id,
               model: (message as any).model,
               tools: (message as any).tools?.length || 0,
@@ -130,17 +159,14 @@ export class ClaudeHandler {
     }
   }
 
-  cleanupInactiveSessions(maxAge: number = 30 * 60 * 1000) {
-    const now = Date.now();
-    let cleaned = 0;
-    for (const [key, session] of this.sessions.entries()) {
-      if (now - session.lastActivity.getTime() > maxAge) {
-        this.sessions.delete(key);
-        cleaned++;
-      }
-    }
-    if (cleaned > 0) {
-      this.logger.info(`Cleaned up ${cleaned} inactive sessions`);
-    }
+  resetSession(userId: string, channelId: string, threadTs?: string): void {
+    const key = this.getSessionKey(userId, channelId, threadTs);
+    this.sessions.delete(key);
+    this.saveSessions();
+    this.logger.info('Session reset', { key });
+  }
+
+  cleanupInactiveSessions() {
+    // Sessions live forever - auto-compress handles long conversations
   }
 }
