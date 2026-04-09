@@ -884,7 +884,10 @@ export class SlackHandler {
   }
 
   setupEventHandlers() {
-    // Agent's own channel: respond to everything without @mention
+    // Agent's OWN home channel: respond to naked (no @mention) messages only.
+    // If the message @mentions ANY user (me or another bot), skip — the app_mention
+    // handler owns that path. This prevents the home bot from double-responding
+    // when Josh @s another teammate in this channel.
     this.app.message(async ({ message, say }) => {
       if (message.subtype !== undefined && message.subtype !== 'file_share') return;
       if (!('user' in message)) return;
@@ -897,32 +900,45 @@ export class SlackHandler {
 
       const isAgentChannel = config.agent.channelId && event.channel === config.agent.channelId;
 
-      // Only respond in agent's own channel (without @mention)
+      // Only auto-respond in this agent's own home channel
       if (!isAgentChannel) return;
 
-      const text = event.text?.replace(/<@[^>]+>/g, '').trim() || '';
+      // If the message contains ANY @mention, defer to the app_mention handler.
+      // Whoever was @'d will handle it; we stay silent to avoid double-posting.
+      if (event.text && /<@[UW][A-Z0-9]+>/.test(event.text)) return;
 
-      this.logger.info('Handling agent channel message', { channel: event.channel });
+      const text = event.text?.trim() || '';
+
+      this.logger.info('Handling home channel message', { channel: event.channel });
       const userName = await this.resolveUserName(event.user);
       await this.handleMessage({ ...event, text, channelContext: `[Channel: your private channel | User: ${userName}]` } as MessageEvent, say);
     });
 
-    // Handle @mentions in agent-hub only
+    // Handle @mentions in ANY channel this bot is a member of.
+    // Slack only fires this event when THIS bot is actually @mentioned, so we
+    // don't need to worry about responding to mentions of other bots.
     this.app.event('app_mention', async ({ event, say }) => {
       const isHub = config.agent.hubChannelId && event.channel === config.agent.hubChannelId;
       const isAgentChannel = config.agent.channelId && event.channel === config.agent.channelId;
 
-      // Only respond to @mentions in agent-hub (agent channel handled above)
-      if (!isHub && !isAgentChannel) return;
-
-      this.logger.info('Handling @mention', { channel: event.channel });
+      this.logger.info('Handling @mention', { channel: event.channel, isHub, isAgentChannel });
       const text = event.text.replace(/<@[^>]+>/g, '').trim();
 
-      const hubUserName = await this.resolveUserName(event.user);
+      let channelContext: string;
+      const mentionUserName = await this.resolveUserName(event.user);
+      if (isHub) {
+        channelContext = `[Channel: #agent-hub (shared team channel — all agents and Josh are here) | User: ${mentionUserName}]`;
+      } else if (isAgentChannel) {
+        channelContext = `[Channel: your private channel | User: ${mentionUserName}]`;
+      } else {
+        // Another agent's home channel, a DM, or a client/project channel — we were explicitly pulled in.
+        channelContext = `[Channel: pulled-in channel (${event.channel}) — you were @mentioned here, respond helpfully in-thread; the channel owner handles non-@ messages | User: ${mentionUserName}]`;
+      }
+
       await this.handleMessage({
         ...event,
         text,
-        channelContext: `[Channel: #agent-hub (shared team channel — other agents and people are here) | User: ${hubUserName}]`,
+        channelContext,
       } as MessageEvent, say);
     });
 
