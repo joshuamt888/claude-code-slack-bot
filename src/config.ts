@@ -23,6 +23,7 @@ export const config = {
     // Per-agent model override. Set CLAUDE_MODEL in the agent's .env.slack
     // (e.g. CLAUDE_MODEL=claude-opus-4-6). Leave unset to use the CLI default.
     model: process.env.CLAUDE_MODEL || undefined,
+    handlerMode: (process.env.HANDLER_MODE || 'sdk') as 'sdk' | 'repl',
   },
   agent: {
     name: process.env.AGENT_NAME || 'claude',

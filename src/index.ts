@@ -1,6 +1,7 @@
 import { App } from '@slack/bolt';
 import { config, validateConfig } from './config';
 import { ClaudeHandler } from './claude-handler';
+import { ClaudeHandlerRepl } from './claude-handler-repl';
 import { SlackHandler } from './slack-handler';
 import { McpManager } from './mcp-manager';
 import { Logger } from './logger';
@@ -12,9 +13,11 @@ async function start() {
     validateConfig();
 
     const agentName = config.agent.name;
+    const handlerMode = config.claude.handlerMode;
     logger.info(`Starting ${agentName} agent`, {
       agentDir: config.agent.dir,
       debug: config.debug,
+      handlerMode,
     });
 
     const app = new App({
@@ -27,8 +30,11 @@ async function start() {
     const mcpManager = new McpManager();
     mcpManager.loadConfiguration();
 
-    const claudeHandler = new ClaudeHandler(mcpManager);
-    const slackHandler = new SlackHandler(app, claudeHandler, mcpManager);
+    const claudeHandler = handlerMode === 'repl'
+      ? new ClaudeHandlerRepl(mcpManager)
+      : new ClaudeHandler(mcpManager);
+    logger.info(`Using ${handlerMode === 'repl' ? 'REPL' : 'SDK'} handler`);
+    const slackHandler = new SlackHandler(app, claudeHandler as any, mcpManager);
 
     slackHandler.setupEventHandlers();
 

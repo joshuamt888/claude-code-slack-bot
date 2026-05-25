@@ -2,6 +2,7 @@ import fetch from 'node-fetch';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execSync } from 'child_process';
 import { Logger } from './logger';
 import { config } from './config';
 
@@ -56,9 +57,12 @@ export class FileHandler {
       }
 
       const buffer = await response.buffer();
-      const tempDir = os.tmpdir();
-      const tempPath = path.join(tempDir, `slack-file-${Date.now()}-${file.name}`);
-      
+      // Use a stable home-dir path instead of os.tmpdir() — /var/folders is not
+      // reliably accessible by the Claude Code CLI when it runs with a fixed cwd.
+      const uploadDir = path.join(os.homedir(), '.claude-slack-uploads');
+      fs.mkdirSync(uploadDir, { recursive: true });
+      const tempPath = path.join(uploadDir, `slack-file-${Date.now()}-${file.name}`);
+
       fs.writeFileSync(tempPath, buffer);
 
       const processed: ProcessedFile = {
@@ -103,6 +107,38 @@ export class FileHandler {
     return textTypes.some(type => mimetype.startsWith(type));
   }
 
+  private isAudioFile(mimetype: string): boolean {
+    return mimetype.startsWith('audio/');
+  }
+
+  /**
+   * Transcribe an audio file using OpenAI Whisper (installed locally via Homebrew).
+   * Falls back gracefully if whisper isn't available.
+   */
+  private transcribeAudio(filePath: string): string | null {
+    try {
+      const tempDir = os.tmpdir();
+      const outputBase = path.join(tempDir, `whisper-${Date.now()}`);
+      // Run whisper with tiny model for speed — good enough for voice memos
+      const result = execSync(
+        `/opt/homebrew/bin/whisper "${filePath}" --model turbo --output_format txt --output_dir "${tempDir}" --fp16 False 2>/dev/null`,
+        { timeout: 120000, encoding: 'utf-8' }
+      );
+      // Whisper writes {filename}.txt in the output dir
+      const baseName = path.basename(filePath, path.extname(filePath));
+      const txtPath = path.join(tempDir, `${baseName}.txt`);
+      if (fs.existsSync(txtPath)) {
+        const transcript = fs.readFileSync(txtPath, 'utf-8').trim();
+        fs.unlinkSync(txtPath); // cleanup
+        return transcript || null;
+      }
+      return null;
+    } catch (error) {
+      this.logger.warn('Whisper transcription failed', { filePath, error });
+      return null;
+    }
+  }
+
   async formatFilePrompt(files: ProcessedFile[], userText: string): Promise<string> {
     let prompt = userText || 'Please analyze the uploaded files.';
     
@@ -114,7 +150,7 @@ export class FileHandler {
           prompt += `\n## Image: ${file.name}\n`;
           prompt += `File type: ${file.mimetype}\n`;
           prompt += `Path: ${file.path}\n`;
-          prompt += `Note: This is an image file that has been uploaded. You can analyze it using the Read tool to examine the image content.\n`;
+          prompt += `Note: This is an image file. You MUST use the Read tool on this path immediately at the start of your response to view the image before doing anything else.\n`;
         } else if (file.isText) {
           prompt += `\n## File: ${file.name}\n`;
           prompt += `File type: ${file.mimetype}\n`;
@@ -128,6 +164,16 @@ export class FileHandler {
             }
           } catch (error) {
             prompt += `Error reading file content: ${error}\n`;
+          }
+        } else if (this.isAudioFile(file.mimetype)) {
+          prompt += `\n## Voice/Audio: ${file.name}\n`;
+          prompt += `File type: ${file.mimetype}\n`;
+          const transcript = this.transcribeAudio(file.path);
+          if (transcript) {
+            prompt += `Transcription:\n\`\`\`\n${transcript}\n\`\`\`\n`;
+            prompt += `Note: This was transcribed from an audio file using Whisper. Respond to the content naturally as if the user said it to you.\n`;
+          } else {
+            prompt += `Note: Audio file received but transcription failed. Ask the user to type their message instead.\n`;
           }
         } else {
           prompt += `\n## File: ${file.name}\n`;

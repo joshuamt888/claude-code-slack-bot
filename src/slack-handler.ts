@@ -915,17 +915,32 @@ export class SlackHandler {
     });
 
     // Handle @mentions in ANY channel this bot is a member of.
-    // Slack only fires this event when THIS bot is actually @mentioned, so we
-    // don't need to worry about responding to mentions of other bots.
+    // Slack *should* only fire this event when THIS bot is actually @mentioned,
+    // but in socket mode with all bots as members of all channels there's a
+    // known edge case where it fires spuriously on the first message of a new
+    // thread. Guard against it by verifying our own user ID is in the text.
     this.app.event('app_mention', async ({ event, say }) => {
+      const botUserId = await this.getBotUserId();
+      if (botUserId && !event.text.includes(`<@${botUserId}>`)) {
+        this.logger.warn('Spurious app_mention — bot not in text, ignoring', {
+          channel: event.channel,
+          botUserId,
+          textSnippet: event.text?.substring(0, 120),
+        });
+        return;
+      }
+
       const isHub = config.agent.hubChannelId && event.channel === config.agent.hubChannelId;
       const isAgentChannel = config.agent.channelId && event.channel === config.agent.channelId;
 
       this.logger.info('Handling @mention', { channel: event.channel, isHub, isAgentChannel });
-      const text = event.text.replace(/<@[^>]+>/g, '').trim();
+      let text = event.text.replace(/<@[^>]+>/g, '').trim();
+      // If the message was JUST the @mention with no other text, inject a placeholder
+      // so handleMessage doesn't silently bail on the empty-text guard (line ~73).
+      if (!text) text = '(pinged you with no additional text — respond with a short hello / ask what they need)';
 
       let channelContext: string;
-      const mentionUserName = await this.resolveUserName(event.user);
+      const mentionUserName = await this.resolveUserName(event.user || 'unknown');
       if (isHub) {
         channelContext = `[Channel: #agent-hub (shared team channel — all agents and Josh are here) | User: ${mentionUserName}]`;
       } else if (isAgentChannel) {
